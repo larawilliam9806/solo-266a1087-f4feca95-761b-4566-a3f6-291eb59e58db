@@ -1,0 +1,157 @@
+{% extends "base.html" %}
+{% block title %}退票核查 · 日结发布台{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>跨日退票核查</h1>
+  <p class="muted">
+    同一张票分多天退款时，在此选择退票日，按原售票日与票号核对原票金额与跨日累计退款。
+    累计退款超过票款标为<strong>超退</strong>；找不到唯一原票标为<strong>待核</strong>。
+    每次核查只取同一时点各日的<strong>最新正式版</strong>，无需逐份读取原始 CSV。
+  </p>
+  <form method="post" action="{{ url_for('update_audit_settings') }}" class="inline-form">
+    <div class="audit-switch">
+      <span class="muted">核查功能：</span>
+      {% if overview.enabled %}
+        <span class="badge ok">已启用{% if overview.enabled_at %} · {{ overview.enabled_at }}{% endif %}</span>
+        <input type="hidden" name="audit_enabled" value="0">
+        <button type="submit" class="button small ghost">停用核查</button>
+      {% else %}
+        <span class="badge bad">未启用</span>
+        <input type="hidden" name="audit_enabled" value="1">
+        <button type="submit" class="button small">启用核查</button>
+      {% endif %}
+    </div>
+  </form>
+  <p class="hint">
+    启用后发布且原件含 <code>sale_day</code> 列、并带非空 <code>ticket_id</code> 与整数分
+    <code>amount</code> 的日批次才纳入核查；停用后再启用会刷新启用时间，此前批次不再纳入。
+  </p>
+</section>
+
+<section class="panel">
+  <h2>选择退票日</h2>
+  {% if overview.included_days %}
+  <form method="get" action="{{ url_for('audit_page') }}" class="inline-form">
+    <div class="field inline-date">
+      <label for="day">退票日（仅限已纳入批次的日期）</label>
+      <select id="day" name="day" required>
+        <option value="">请选择…</option>
+        {% for item in overview.included_days %}
+        <option value="{{ item.day }}" {% if item.day == selected %}selected{% endif %}>
+          {{ item.day }} · r{{ item.rev }}
+        </option>
+        {% endfor %}
+      </select>
+    </div>
+    <button type="submit" class="button">生成核查报告</button>
+  </form>
+  {% else %}
+  <p class="empty">当前没有纳入核查的日批次。请启用核查后上传含 <code>sale_day</code> 列的 CSV 并发布。</p>
+  {% endif %}
+  {% if selected_error %}
+  <div class="alert danger">{{ selected_error }}</div>
+  {% endif %}
+</section>
+
+{% if report %}
+<section class="panel">
+  <h2>{{ report.day }} 退票核查报告 <span class="muted">· r{{ report.rev }} · 生成于 {{ report.generated_at }}</span></h2>
+  <div class="summary-grid">
+    <div class="summary-card"><div class="summary-label">核查票数</div><div class="summary-value">{{ report.summary.group_count }}</div></div>
+    <div class="summary-card bad"><div class="summary-label">超退</div><div class="summary-value">{{ report.summary.over_refund_count }}</div></div>
+    <div class="summary-card"><div class="summary-label">待核</div><div class="summary-value">{{ report.summary.pending_count }}</div></div>
+    <div class="summary-card ok"><div class="summary-label">正常</div><div class="summary-value">{{ report.summary.ok_count }}</div></div>
+  </div>
+  <p class="hint">纳入核查的日期（同一时点各日最新正式版，共 {{ report.included_days|length }} 天）：
+    {% for d in report.included_days %}<span class="chip">{{ d }}</span>{% endfor %}
+  </p>
+
+  {% if report.groups %}
+  <div class="table-scroll">
+    <table class="grid">
+      <thead><tr>
+        <th>状态</th><th>原售票日</th><th>票号</th><th>原票金额（分）</th>
+        <th>累计退款（分）</th><th>退款笔数</th><th>追溯</th>
+      </tr></thead>
+      <tbody>
+      {% for g in report.groups %}
+        <tr class="audit-row audit-{{ g.status }}">
+          <td>
+            <span class="badge {% if g.status == 'over_refund' %}bad{% elif g.status == 'pending' %}warn-badge{% else %}ok{% endif %}">
+              {{ status_labels[g.status] }}
+            </span>
+            {% if g.status == 'pending' %}
+              <div class="hint">{{ pending_labels[g.pending_reason] }}</div>
+            {% endif %}
+          </td>
+          <td>{{ g.sale_day }}</td>
+          <td class="mono">{{ g.ticket_id }}</td>
+          <td>{% if g.original %}{{ g.original.amount }}{% else %}—{% endif %}</td>
+          <td class="{% if g.status == 'over_refund' %}cell-bad{% endif %}">{{ g.refund_total }}</td>
+          <td>{{ g.refund_count }}</td>
+          <td>
+            <details>
+              <summary class="hint">原票与 {{ g.refunds|length }} 条退票</summary>
+              <table class="grid compact trace-table">
+                <thead><tr><th>角色</th><th>日期</th><th>修订</th><th>数据行</th><th>原件行号</th><th>金额（分）</th></tr></thead>
+                <tbody>
+                {% if g.original %}
+                  <tr>
+                    <td>原票</td><td>{{ g.original.day }}</td><td>r{{ g.original.rev }}</td>
+                    <td>{{ g.original.row_index }}</td><td>{{ g.original.source_line }}</td>
+                    <td>{{ g.original.amount }}</td>
+                  </tr>
+                {% endif %}
+                {% if g.candidates %}
+                  {% for c in g.candidates %}
+                  <tr class="row-bad">
+                    <td>候选原票</td><td>{{ c.day }}</td><td>r{{ c.rev }}</td>
+                    <td>{{ c.row_index }}</td><td>{{ c.source_line }}</td><td>{{ c.amount }}</td>
+                  </tr>
+                  {% endfor %}
+                {% endif %}
+                {% for r in g.refunds %}
+                  <tr>
+                    <td>退票</td><td>{{ r.day }}</td><td>r{{ r.rev }}</td>
+                    <td>{{ r.row_index }}</td><td>{{ r.source_line }}</td><td>{{ r.amount }}</td>
+                  </tr>
+                {% endfor %}
+                </tbody>
+              </table>
+            </details>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">该退票日没有退票记录（sale_day 已填的行）。</p>
+  {% endif %}
+</section>
+{% endif %}
+
+<section class="panel">
+  <h2>未纳入核查的日期（{{ overview.excluded_days|length }} 天）</h2>
+  {% if overview.excluded_days %}
+  <div class="table-scroll">
+    <table class="grid">
+      <thead><tr><th>日期</th><th>当前修订</th><th>含 sale_day 列</th><th>发布时间</th><th>未纳入原因</th></tr></thead>
+      <tbody>
+      {% for item in overview.excluded_days %}
+        <tr>
+          <td>{{ item.day }}</td>
+          <td>r{{ item.rev }}</td>
+          <td>{{ "是" if item.has_sale_day else "否" }}</td>
+          <td>{{ item.created_at }}</td>
+          <td>{{ item.reason_label }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">所有已发布日期均已纳入核查。</p>
+  {% endif %}
+</section>
+{% endblock %}

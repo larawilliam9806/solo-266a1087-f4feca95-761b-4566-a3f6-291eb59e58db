@@ -14,7 +14,7 @@ from flask import (
     url_for,
 )
 
-from . import convert, db, domain
+from . import audit as audit_mod, convert, db, domain
 from .errors import AppError, NotFound, Unprocessable
 from .publisher import Service
 from .storage import BlobStore, verify_publications
@@ -225,6 +225,39 @@ def create_app(config=None):
             abort(404)
         return render_template("day.html", detail=detail)
 
+    @app.get("/audit")
+    def audit_page():
+        overview = service.audit_overview()
+        selected = request.args.get("day") or ""
+        report = None
+        selected_error = None
+        included = {item["day"] for item in overview["included_days"]}
+        if selected:
+            try:
+                if selected not in included:
+                    raise AppError(
+                        "该日期没有纳入核查的日批次，无法生成退票核查报告",
+                        code="day_not_included",
+                    )
+                report = service.audit_report(selected)
+            except AppError as err:
+                selected_error = err.message
+        return render_template(
+            "audit.html",
+            overview=overview,
+            report=report,
+            selected=selected,
+            selected_error=selected_error,
+            status_labels=audit_mod.STATUS_LABELS,
+            pending_labels=audit_mod.PENDING_REASONS,
+        )
+
+    @app.post("/audit/settings")
+    def update_audit_settings():
+        enabled = request.form.get("audit_enabled") in ("1", "true", "on", "yes")
+        service.set_audit_enabled(enabled)
+        return redirect(url_for("audit_page"))
+
     # ------------------------------------------------------------------
     # API
     # ------------------------------------------------------------------
@@ -270,6 +303,22 @@ def create_app(config=None):
     @app.get("/api/days/<day>")
     def api_day(day):
         return jsonify(service.day_detail(day))
+
+    @app.get("/api/audit")
+    def api_audit_overview():
+        return jsonify(service.audit_overview())
+
+    @app.get("/api/audit/<day>")
+    def api_audit_report(day):
+        return jsonify(service.audit_report(day))
+
+    @app.post("/api/audit/settings")
+    def api_update_audit_settings():
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict) or "enabled" not in body:
+            raise AppError("请求体必须包含 enabled 布尔值", code="bad_audit_setting")
+        enabled = bool(body["enabled"])
+        return jsonify(service.set_audit_enabled(enabled))
 
     @app.get("/api/contracts")
     def api_contracts():

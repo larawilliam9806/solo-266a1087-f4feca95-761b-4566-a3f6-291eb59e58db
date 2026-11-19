@@ -6,13 +6,18 @@
   <p class="muted">当前修订：<strong>r{{ detail.current_rev }}</strong>。三个文件始终以同一修订号成组下载。</p>
   {% if detail.revisions %}
   <table class="grid">
-    <thead><tr><th>修订</th><th>发布时间</th><th>数据行</th><th>原件</th><th>结算 v</th><th>客流 v</th><th>下载</th></tr></thead>
+    <thead><tr><th>修订</th><th>发布时间</th><th>数据行</th><th>核查</th><th>原件</th><th>结算 v</th><th>客流 v</th><th>下载</th></tr></thead>
     <tbody>
     {% for rev in detail.revisions %}
       <tr{% if rev.rev == detail.current_rev %} class="current"{% endif %}>
         <td><strong>r{{ rev.rev }}</strong>{% if rev.rev == detail.current_rev %} <span class="tag">当前</span>{% endif %}</td>
         <td>{{ rev.created_at }}</td>
         <td>{{ rev.row_count }}</td>
+        <td>
+          {% if rev.audit_eligible %}<span class="badge ok">纳入</span>
+          {% elif rev.has_sale_day %}<span class="badge warn-badge">未纳入</span>
+          {% else %}<span class="tag">无 sale_day</span>{% endif %}
+        </td>
         <td title="{{ rev.original.sha256 }}">{{ rev.original.name }}<br><span class="muted mono">{{ rev.original.sha256[:12] }}… · {{ rev.original.size }} B</span></td>
         <td>v{{ rev.downstreams.settlement.contract_version }}<br><span class="muted mono">{{ rev.downstreams.settlement.sha256[:12] }}…</span></td>
         <td>v{{ rev.downstreams.ridership.contract_version }}<br><span class="muted mono">{{ rev.downstreams.ridership.sha256[:12] }}…</span></td>

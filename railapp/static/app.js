@@ -163,6 +163,8 @@
       stack.appendChild(renderDownstream(name, preview.downstreams[name]));
     });
 
+    renderAudit(preview.audit);
+
     root.hidden = false;
     confirmButton.disabled = !preview.convertible;
     confirmButton.title = preview.convertible
@@ -171,6 +173,65 @@
     setStatus(confirmStatus, preview.convertible
       ? "请核对预览后确认发布；确认后该日修订号 +1。"
       : "存在不兼容内容，整批不可发布。", preview.convertible ? "" : "bad");
+  }
+
+  function renderAudit(auditInfo) {
+    if (!auditInfo) return;
+    const node = el("section", "panel downstream " + (auditInfo.blocked ? "is-bad" : "is-ok"));
+    const header = el("header");
+    header.appendChild(el("h2", "", "跨日退票核查规则"));
+    const badge = el("span", "badge " + (auditInfo.blocked ? "bad" : "ok"));
+    if (!auditInfo.enabled) {
+      badge.textContent = "功能未启用";
+    } else if (!auditInfo.has_sale_day) {
+      badge.textContent = "不纳入（无 sale_day 列）";
+    } else if (auditInfo.blocked) {
+      badge.textContent = "核查不通过";
+    } else {
+      badge.textContent = "核查通过";
+    }
+    header.appendChild(badge);
+    node.appendChild(header);
+
+    const note = el("p", "muted");
+    if (!auditInfo.enabled) {
+      note.textContent = "核查功能未启用，本批次不参与退票核查，发布不受核查规则限制。";
+    } else if (!auditInfo.has_sale_day) {
+      note.textContent = "原件缺少 sale_day 列，本批次不纳入核查；发布不受核查规则限制。";
+    } else {
+      note.textContent =
+        `已纳入核查：ticket_id 非空、amount 为整数分（售票正额/退票负额）、` +
+        `sale_day 留空或填写不晚于批次日的原售票日。合规数据行 ${auditInfo.valid_row_count} 行。`;
+    }
+    node.appendChild(note);
+
+    if (auditInfo.violations && auditInfo.violations.length) {
+      const box = el("div", "ds-issues");
+      box.hidden = false;
+      const heading = el("h3", "", "核查违规行（整批不可发布）");
+      box.appendChild(heading);
+      const scroll = el("div", "table-scroll");
+      const table = el("table", "grid issue-table");
+      table.innerHTML =
+        "<thead><tr><th>数据行</th><th>文件行号</th><th>列</th><th>值</th><th>原因</th></tr></thead><tbody></tbody>";
+      const tbody = table.querySelector("tbody");
+      auditInfo.violations.forEach((issue) => {
+        const tr = el("tr");
+        tr.appendChild(el("td", "", issue.row === null ? "—" : issue.row));
+        tr.appendChild(el("td", "", issue.line === null ? "—" : issue.line));
+        tr.appendChild(el("td", "", issue.column));
+        tr.appendChild(el("td", "mono", issue.value === null ? "—" : issue.value));
+        tr.appendChild(el("td", "", issue.reason));
+        tbody.appendChild(tr);
+      });
+      scroll.appendChild(table);
+      box.appendChild(scroll);
+      if (auditInfo.violations_truncated) {
+        box.appendChild(el("p", "muted issue-note", "问题过多，仅显示前 200 条；请修正后重新上传。"));
+      }
+      node.appendChild(box);
+    }
+    stack.appendChild(node);
   }
 
   form.addEventListener("submit", async (event) => {

@@ -21,7 +21,7 @@ import json
 import os
 import uuid
 
-from . import convert, db, domain
+from . import audit, convert, db, domain
 from .errors import AppError, Conflict, NotFound, Unprocessable, Unavailable
 from .storage import BlobStore
 
@@ -82,6 +82,8 @@ def _publication_payload(row):
         "downloads": {
             kind: f"/download/{row['day']}/{row['rev']}/{kind}" for kind in KINDS
         },
+        "has_sale_day": bool(row["has_sale_day"]),
+        "audit_eligible": bool(row["audit_eligible"]),
     }
 
 
@@ -102,6 +104,16 @@ def _preview_public_payload(preview):
             for name in domain.DOWNSTREAM_ORDER
         },
         "downstreams": result["downstreams"],
+        "audit": {
+            "enabled": result["audit"]["enabled"],
+            "enabled_at": result["audit"]["enabled_at"],
+            "applicable": result["audit"]["applicable"],
+            "has_sale_day": result["audit"]["has_sale_day"],
+            "blocked": result["audit"]["blocked"],
+            "violations": result["audit"]["violations"],
+            "violations_truncated": result["audit"]["violations_truncated"],
+            "valid_row_count": result["audit"]["valid_row_count"],
+        },
         "created_at": preview["created_at"],
         "expires_at": preview["expires_at"],
     }
@@ -139,6 +151,7 @@ class Service:
             try:
                 contracts = db.get_contracts(conn)
                 base_rev = db.day_revision(conn, day)
+                audit_settings = db.get_audit_settings(conn)
             finally:
                 conn.execute("COMMIT")
             db.purge_expired_previews(conn)
@@ -149,6 +162,14 @@ class Service:
                 results[name] = outcome
                 if outcome["status"] != "ok":
                     convertible = False
+
+            # Refund-audit validation runs for batches the feature covers:
+            # enabled at preview time and carrying a sale_day column.
+            audit_outcome = audit.inspect_batch(parsed, day, audit_settings["enabled"])
+            audit_blocked = bool(audit_outcome["violations"])
+            if audit_blocked:
+                convertible = False
+
             original_name = _safe_name(filename)
             original_sha = self.store.put_bytes(raw_bytes)
             for name in domain.DOWNSTREAM_ORDER:
@@ -175,6 +196,17 @@ class Service:
                     for name in domain.DOWNSTREAM_ORDER
                 },
                 "downstreams": results,
+                "audit": {
+                    "enabled": audit_settings["enabled"],
+                    "enabled_at": audit_settings["enabled_at"],
+                    "applicable": audit_outcome["applicable"],
+                    "has_sale_day": audit_outcome["has_sale_day"],
+                    "blocked": audit_blocked,
+                    "violations": audit_outcome["violations"],
+                    "violations_truncated": audit_outcome["violations_truncated"],
+                    "valid_row_count": audit_outcome["valid_row_count"],
+                    "rows": audit_outcome["rows"],
+                },
                 "convertible": convertible,
             }
             preview_id = uuid.uuid4().hex
@@ -260,6 +292,30 @@ class Service:
                         )
 
                 if not preview["convertible"] or not result.get("convertible"):
+                    # Re-materialise first so audit violations — which carry
+                    # their own error code and details — take precedence over
+                    # the generic downstream incompatibility.
+                    original_bytes = self.store.read_bytes(preview["original_sha256"])
+                    if hashlib.sha256(original_bytes).hexdigest() != preview["original_sha256"]:
+                        raise Unavailable("预览原件校验失败，请重新上传并预览")
+                    try:
+                        parsed = convert.parse_csv_bytes(original_bytes)
+                    except convert.CsvProblem:
+                        raise Unavailable(
+                            "预览原件无法再次解析，请重新上传并预览"
+                        ) from None
+                    audit_settings = db.get_audit_settings(conn)
+                    audit_outcome = audit.inspect_batch(parsed, day, audit_settings["enabled"])
+                    if audit_outcome["violations"]:
+                        raise Unprocessable(
+                            "退票核查规则校验未通过，不能发布；请修正后重新预览",
+                            code="audit_violation",
+                            details={
+                                "kind": "audit_violation",
+                                "violations": audit_outcome["violations"][:200],
+                                "violations_truncated": audit_outcome["violations_truncated"],
+                            },
+                        )
                     raise Unprocessable(
                         "存在不兼容的列或行，不能发布；请修正 CSV 或契约后重新预览",
                         code="incompatible",
@@ -276,6 +332,22 @@ class Service:
                     raise Unavailable(
                         "预览原件无法再次解析，请重新上传并预览"
                     ) from None
+
+                # Re-validate audit rules against the *current* feature flag:
+                # enabling after the preview immediately enforces the rules,
+                # while a failed publish leaves the previous revision current.
+                audit_settings = db.get_audit_settings(conn)
+                audit_outcome = audit.inspect_batch(parsed, day, audit_settings["enabled"])
+                if audit_outcome["violations"]:
+                    raise Unprocessable(
+                        "退票核查规则校验未通过，不能发布；请修正后重新预览",
+                        code="audit_violation",
+                        details={
+                            "kind": "audit_violation",
+                            "violations": audit_outcome["violations"][:200],
+                            "violations_truncated": audit_outcome["violations_truncated"],
+                        },
+                    )
 
                 outputs = {}
                 for name in domain.DOWNSTREAM_ORDER:
@@ -304,8 +376,9 @@ class Service:
                         settlement_sha256, settlement_size, ridership_sha256, ridership_size,
                         settlement_fingerprint, ridership_fingerprint,
                         settlement_version, ridership_version,
-                        settlement_columns, ridership_columns, row_count, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        settlement_columns, ridership_columns, row_count, created_at,
+                        has_sale_day, audit_eligible)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         day,
                         new_rev,
@@ -324,8 +397,14 @@ class Service:
                         ridership_cols,
                         parsed.row_count,
                         created_at,
+                        1 if audit_outcome["has_sale_day"] else 0,
+                        1 if audit_outcome["applicable"] else 0,
                     ),
                 )
+                # Normalised audit rows are frozen with the revision so
+                # reports never re-read raw CSV blobs.
+                if audit_outcome["applicable"]:
+                    db.insert_audit_rows(conn, day, new_rev, audit_outcome["rows"])
                 if current_rev == 0:
                     conn.execute(
                         "INSERT INTO days (day, current_rev, updated_at) VALUES (?, ?, ?)",
@@ -370,6 +449,110 @@ class Service:
             }
         finally:
             conn.close()
+
+    # ------------------------------------------------------------------
+    # refund audit
+    # ------------------------------------------------------------------
+    def set_audit_enabled(self, enabled):
+        conn = self.conn_factory()
+        try:
+            with db.transaction(conn, immediate=True):
+                state = db.set_audit_enabled(conn, enabled)
+        finally:
+            conn.close()
+        return state
+
+    def audit_overview(self):
+        """List every published day with its inclusion status, from DB rows.
+
+        Only publication metadata (never raw CSV content) is read, so the
+        exclusion list is available without touching the original blobs.
+        """
+        conn = self.conn_factory()
+        try:
+            settings = db.get_audit_settings(conn)
+            days = db.list_days(conn)
+            day_names = [item["day"] for item in days]
+            current = {
+                item["day"]: item
+                for item in db.list_current_publications(conn, day_names)
+            }
+            included, excluded = [], []
+            for item in days:
+                publication = current.get(item["day"])
+                if publication is None:
+                    continue
+                if audit.is_included(publication, settings["enabled"], settings["enabled_at"]):
+                    included.append(
+                        {
+                            "day": item["day"],
+                            "rev": publication["rev"],
+                            "created_at": publication["created_at"],
+                            "has_sale_day": bool(publication["has_sale_day"]),
+                        }
+                    )
+                else:
+                    code = audit.exclusion_reason(
+                        publication, settings["enabled"], settings["enabled_at"]
+                    )
+                    excluded.append(
+                        {
+                            "day": item["day"],
+                            "rev": publication["rev"],
+                            "created_at": publication["created_at"],
+                            "has_sale_day": bool(publication["has_sale_day"]),
+                            "reason": code,
+                            "reason_label": audit.EXCLUSION_REASONS[code],
+                        }
+                    )
+            return {
+                "enabled": settings["enabled"],
+                "enabled_at": settings["enabled_at"],
+                "included_days": sorted(included, key=lambda x: x["day"]),
+                "excluded_days": sorted(excluded, key=lambda x: x["day"]),
+            }
+        finally:
+            conn.close()
+
+    def audit_report(self, refund_day):
+        """Build the refund-day report against one point-in-time snapshot.
+
+        A single read transaction resolves every day's current revision and
+        reads all their audit rows together, so concurrent republishing can
+        never mix revisions inside one report.
+        """
+        refund_day = _check_day(refund_day)
+        conn = self.conn_factory()
+        try:
+            conn.execute("BEGIN")
+            try:
+                settings = db.get_audit_settings(conn)
+                days = db.list_days(conn)
+                day_names = [item["day"] for item in days]
+                publications = db.list_current_publications(conn, day_names)
+                included_pubs = [
+                    pub
+                    for pub in publications
+                    if audit.is_included(pub, settings["enabled"], settings["enabled_at"])
+                ]
+                if not any(pub["day"] == refund_day for pub in included_pubs):
+                    raise AppError(
+                        "该日期没有纳入核查的日批次，无法生成退票核查报告",
+                        code="day_not_included",
+                    )
+                day_revs = [(pub["day"], pub["rev"]) for pub in included_pubs]
+                rows = db.list_audit_rows(conn, day_revs)
+                current_rev = db.day_revision(conn, refund_day)
+                generated_at = db.iso(db.utcnow())
+            finally:
+                conn.execute("COMMIT")
+        finally:
+            conn.close()
+
+        included_days = sorted(pub["day"] for pub in included_pubs)
+        return audit.build_report(
+            refund_day, current_rev, rows, included_days, generated_at
+        )
 
     def resolve_download(self, day, rev, kind):
         day = _check_day(day)

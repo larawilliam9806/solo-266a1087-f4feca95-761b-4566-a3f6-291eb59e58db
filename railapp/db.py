@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS publications (
     ridership_columns      TEXT NOT NULL,
     row_count              INTEGER NOT NULL,
     created_at             TEXT NOT NULL,
+    has_sale_day           INTEGER NOT NULL DEFAULT 0,
+    audit_eligible         INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (day, rev)
 );
 
@@ -60,15 +62,50 @@ CREATE TABLE IF NOT EXISTS previews (
     consumed_at            TEXT
 );
 
+CREATE TABLE IF NOT EXISTS app_settings (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_rows (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    day          TEXT NOT NULL,
+    rev          INTEGER NOT NULL,
+    row_index    INTEGER NOT NULL,
+    source_line  INTEGER NOT NULL,
+    ticket_id    TEXT NOT NULL,
+    amount       INTEGER NOT NULL,
+    sale_day     TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_publications_day ON publications(day, rev);
 CREATE INDEX IF NOT EXISTS idx_previews_expiry ON previews(expires_at);
+CREATE INDEX IF NOT EXISTS idx_audit_day_rev ON audit_rows(day, rev);
+CREATE INDEX IF NOT EXISTS idx_audit_ticket ON audit_rows(sale_day, ticket_id);
 """
+
+AUDIT_ENABLED_KEY = "audit_enabled"
+AUDIT_ENABLED_AT_KEY = "audit_enabled_at"
+
+# Lightweight migration for databases created before the audit feature.
+_MIGRATIONS = (
+    (
+        "has_sale_day",
+        "ALTER TABLE publications ADD COLUMN has_sale_day INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "audit_eligible",
+        "ALTER TABLE publications ADD COLUMN audit_eligible INTEGER NOT NULL DEFAULT 0",
+    ),
+)
 
 PREVIEW_TTL_SECONDS = 2 * 60 * 60
 
 
 def utcnow():
-    return datetime.now(timezone.utc).replace(microsecond=0)
+    # Keep microseconds: enable/publish ordering within one second must be
+    # distinguishable for the audit inclusion check.
+    return datetime.now(timezone.utc)
 
 
 def iso(moment):
@@ -99,6 +136,7 @@ def transaction(conn, *, immediate=False):
 
 def init_db(conn):
     conn.executescript(SCHEMA)
+    _migrate(conn)
     now = iso(utcnow())
     for downstream in domain.DOWNSTREAM_ORDER:
         columns = domain.DEFAULT_CONTRACTS[downstream]
@@ -112,6 +150,105 @@ def init_db(conn):
                 now,
             ),
         )
+    # The audit feature ships disabled; the first explicit enable flips it.
+    conn.execute(
+        "INSERT OR IGNORE INTO app_settings (key, value) VALUES (?, ?)",
+        (AUDIT_ENABLED_KEY, "0"),
+    )
+
+
+def _migrate(conn):
+    existing = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(publications)").fetchall()
+    }
+    for column, statement in _MIGRATIONS:
+        if column not in existing:
+            conn.execute(statement)
+
+
+def get_setting(conn, key, default=None):
+    row = conn.execute(
+        "SELECT value FROM app_settings WHERE key = ?", (key,)
+    ).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(conn, key, value):
+    conn.execute(
+        """INSERT INTO app_settings (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+        (key, str(value)),
+    )
+
+
+def get_audit_settings(conn):
+    return {
+        "enabled": get_setting(conn, AUDIT_ENABLED_KEY, "0") == "1",
+        "enabled_at": get_setting(conn, AUDIT_ENABLED_AT_KEY),
+    }
+
+
+def set_audit_enabled(conn, enabled):
+    """Toggle the audit feature.
+
+    Enabling (including re-enabling after a disable) stamps the current UTC
+    time: only revisions published at or after that point can enter audits.
+    Disabling keeps the stored timestamp for history.
+    """
+    current = get_audit_settings(conn)
+    now = iso(utcnow())
+    set_setting(conn, AUDIT_ENABLED_KEY, "1" if enabled else "0")
+    if enabled and not current["enabled"]:
+        set_setting(conn, AUDIT_ENABLED_AT_KEY, now)
+    return get_audit_settings(conn) | {"updated_at": now}
+
+
+def insert_audit_rows(conn, day, rev, rows):
+    conn.executemany(
+        """INSERT INTO audit_rows
+           (day, rev, row_index, source_line, ticket_id, amount, sale_day)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        [
+            (
+                day,
+                rev,
+                row["row_index"],
+                row["source_line"],
+                row["ticket_id"],
+                row["amount"],
+                row["sale_day"],
+            )
+            for row in rows
+        ],
+    )
+
+
+def list_current_publications(conn, days):
+    """Return the current-revision publication for each given day."""
+    if not days:
+        return []
+    rows = conn.execute(
+        """SELECT p.* FROM publications p
+           JOIN days d ON d.day = p.day AND d.current_rev = p.rev
+           WHERE p.day IN (%s)""" % ",".join("?" for _ in days),
+        list(days),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_audit_rows(conn, day_revs):
+    """Return audit rows for a list of (day, rev) pairs, ordered for display."""
+    if not day_revs:
+        return []
+    clauses = " OR ".join("(day = ? AND rev = ?)" for _ in day_revs)
+    params = [value for pair in day_revs for value in pair]
+    rows = conn.execute(
+        f"SELECT * FROM audit_rows WHERE {clauses} "
+        "ORDER BY day, row_index, id",
+        params,
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def get_contract(conn, downstream):
